@@ -1,0 +1,21 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${default}" //只需要加这一行，就是这么简单
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "compilerPath": "cl.exe",
+            "intelliSenseMode": "windows-msvc-x64",
+            "outDir" : "${fileDirname}\\build\\${fileBasenameNoExtension}.exe"
+            
+        }
+    ],
+    "version": 4
+}

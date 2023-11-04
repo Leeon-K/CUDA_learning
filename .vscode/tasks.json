@@ -1,0 +1,24 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "mynvcc",		
+            "type": "shell",
+            "command": "nvcc",
+            "args":["-g","-G", "-o","${fileDirname}/${fileBasenameNoExtension}.exe","${file}",
+
+                "-I", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.3\\include",
+                "-I", "C:\\ProgramData\\NVIDIA Corporation\\CUDA Samples\\v11.3\\common\\inc",
+                "-L", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.3\\lib\\x64",   
+                "-L", "C:\\ProgramData\\NVIDIA Corporation\\CUDA Samples\\v11.3\\common\\inc\\lib",  
+                "-l", "cudart",                           
+                "-l", "cublas",
+                "-l", "cudnn",
+                "-l", "/curand",
+                "-D_MWAITXINTRIN_H_INCLUDED"  
+            ]
+        }
+    ]
+}
+
+

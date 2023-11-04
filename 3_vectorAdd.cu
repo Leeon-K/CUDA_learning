@@ -27,6 +27,7 @@ void vec_add_cpu(float *x, float *y,float *z,int N)
 
 int main()
 {
+    printf("Hello World!\n");
     int N = 10000;
     int nbytes = N * sizeof(float);
 
