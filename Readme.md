@@ -1,40 +1,8 @@
-## Reduce优化
-#### baseline
-```
-for (size_t i = 0; i < n; ++i) {
-      sum += input[i];
-    }
-```
-#### v0  并行化处理 引入了 shared memory
-```
-template<int blockSize>
-__global__ void reduce_v0(float *d_in,float *d_out){
-    __shared__ float smem[blockSize]; // blocksize = 256
+## 矩阵乘优化
+- naive版本，仅达到cublas 10%性能
 
-    int tid = threadIdx.x;
-    // load: 每个线程加载一个元素到shared mem对应位置
-    smem[tid] = d_in[tid];
-    __syncthreads(); // 把sharememory同步一下
+- v1   global分块到shared_mem --》 v2 shared_mem 分块 到register
 
-    // compute: reduce in shared mem
-    // 引入了 shared memory
-    for(int index = 1; index < blockDim.x; index *= 2) {
-        if (tid % (2 * index) == 0) { // 第一轮只有0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30这些线程会执行 // 后面0 4 8 16 32 64 128 256
-            smem[tid] += smem[tid + index];
-            // printf("tid: %d,index %d, smem[tid]: %f, smem[tid + index]: %f\n", tid,index, smem[tid], smem[tid + index]);
-        }
-        __syncthreads();
-    }
+  从global_mem到shared_mem，对global mem访存太多，考虑分块放到shared mem。从global mem中读取次数为M=m/bm.N=n/bn.k=K/bk... M\*N\*K\*(bm\*bk + bk\*bn) ---> **m\*n\*k\*(1/bm + 1/bn)**  。不对shared mem分块，每个线程负责C中的一个元素的计算
 
-    // store: write back to global mem
-    if (tid == 0) {
-        d_out[blockIdx.x] = smem[0];
-    }
-}
-```
-#### v1 消除warp divergence（index 123的） 
-每个warp内线程一起干活
-
-#### v2 避免bank conflict 
-常用：padding
-#### v3 
+- v2 
