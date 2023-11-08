@@ -17,7 +17,7 @@
 // #define B(i,j) B[(i) + (j)*ldb]
 // #define C(i,j) C[(i) + (j)*ldc]
 #define IDX2C(i, j, ld) ((j) * (ld) + (i)) // columb-major
-#define IDX2R(i, j, ld) ((i) * (ld) + (j)) // row-major
+#define IDX2R(i, j, lr) ((i) * (lr) + (j)) // row-major
 void cpuSgemm(const int m,const int n,const int k,const float* alpha, const float *A, const float *B,
     const float *beta, float* C){
     for (int idx_m = 0; idx_m < m; idx_m++){
@@ -44,7 +44,7 @@ __global__ void naive_matmul(const int m,const int n,const int k,const float alp
     C[IDX2C(tx,ty,m)] = alpha * sum + beta * C[IDX2C(tx,ty,m)];
 }
 
-__global__ void gemm_shared_plus(const int m,const int n,const int k,const float alpha, const float *A, const float *B, const float beta, float* C)
+__global__ void gemm_shared_mircokernel(const int m,const int n,const int k,const float alpha, const float *A, const float *B, const float beta, float* C)
 {
     // 分配共享内存  
     __shared__ float sa[BM*BK];
@@ -52,23 +52,41 @@ __global__ void gemm_shared_plus(const int m,const int n,const int k,const float
 
     int tx = threadIdx.x; // 一个block有32*32个线程
     int bx = blockIdx.x, by = blockIdx.y;
-    int row = tx&31, col = tx>>5; 
+    // int row = tx&31, col = tx>>5; // 低位行x  高维列y
+    int row1 = (tx&7)<<2, row2 = row1 + 1,row3 = row1 + 2,row4 = row1 + 3;
+    int col = tx>>3; // 3位是row 每一个thread  4x1 micro kernel； 5位是col
     A = &A[IDX2C(bx<<5,0,m)]; // blockdim(32,32)
     B = &B[IDX2C(0,by<<5,k)];
     C = &C[IDX2C(bx<<5,by<<5,m)];
-    float sum = 0.0;
+    float Cres[4] = {0., 0., 0., 0.};
+    float b00;
     for (int i = 0; i < k; i += BK){
-        sa[IDX2R(row,col,BK)] = A[IDX2C(row,col,m)];
-        sb[IDX2R(col,row,BN)] = B[IDX2C(row,col,k)]; // 一次读取一个方块
+        // 存储是 列主序
+        sa[IDX2C(row1,col,BM)] = A[IDX2C(row1,col,m)]; 
+        sa[IDX2C(row2,col,BM)] = A[IDX2C(row2,col,m)];
+        sa[IDX2C(row3,col,BM)] = A[IDX2C(row3,col,m)];
+        sa[IDX2C(row4,col,BM)] = A[IDX2C(row4,col,m)];
+        sb[IDX2C(col,row1,BK)] = B[IDX2C(row1,col,k)]; // 一次读取一个方块
+        sb[IDX2C(col,row2,BK)] = B[IDX2C(row2,col,k)]; 
+        sb[IDX2C(col,row3,BK)] = B[IDX2C(row3,col,k)]; 
+        sb[IDX2C(col,row4,BK)] = B[IDX2C(row4,col,k)]; 
         A += m<<5; // 一行 一次32行
         B += 32; //小方块一列32
         __syncthreads();
+        // #pragma unroll
         for (int b_k = 0; b_k < BK; b_k++){
-            sum += sa[IDX2R(row,b_k,BK)] * sb[IDX2R(col,b_k,BN)];
+            b00 = sb[IDX2C(col,b_k,BK)]; // row是threadIdx
+            Cres[0] += sa[IDX2C(row1,b_k,BM)] * b00;
+            Cres[1] += sa[IDX2C(row2,b_k,BM)] * b00; 
+            Cres[2] += sa[IDX2C(row3,b_k,BM)] * b00; 
+            Cres[3] += sa[IDX2C(row4,b_k,BM)] * b00; 
         }
         __syncthreads();
     }
-    C[IDX2C(row,col,m)] = alpha * sum + beta * C[IDX2C(row,col,m)];
+    C[IDX2C(row1,col,m)] = alpha * Cres[0] + beta * C[IDX2C(row1,col,m)];
+    C[IDX2C(row2,col,m)] = alpha * Cres[1] + beta * C[IDX2C(row2,col,m)];
+    C[IDX2C(row3,col,m)] = alpha * Cres[2] + beta * C[IDX2C(row3,col,m)];
+    C[IDX2C(row4,col,m)] = alpha * Cres[3] + beta * C[IDX2C(row4,col,m)];
 }
 
 void gpuSgemm(int m, int n, int k, const float *alpha, 
@@ -79,7 +97,7 @@ void gpuSgemm(int m, int n, int k, const float *alpha,
         int gridx = floor(M/32);
         int gridy = floor(N/32);
         dim3 Grid(gridx, gridy); //
-        dim3 Block(1024); // 32 * 32 = 1024  
+        dim3 Block(256); // 32 * 32 = 1024  
         //malloc on device
         float *devPtrA, *devPtrB, *devPtrC,*devPtrD;
         cudaMalloc((void**)&devPtrA, sizeof(float) * m * k);
@@ -94,7 +112,7 @@ void gpuSgemm(int m, int n, int k, const float *alpha,
         cudaEventCreate(&stop);
         cudaEventRecord(start);
 // ------------------------------------------------------------------------------------
-        gemm_shared_plus<<<Grid,Block>>>(m,n,k,*alpha,devPtrA,devPtrB,*beta,devPtrC);
+        gemm_shared_mircokernel<<<Grid,Block>>>(m,n,k,*alpha,devPtrA,devPtrB,*beta,devPtrC);
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
     

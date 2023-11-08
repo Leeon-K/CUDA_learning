@@ -57,13 +57,13 @@ __global__ void gemm_shared_v2(const int m,const int n,const int k,const float a
     C = &C[IDX2C(bx<<5,by<<5,m)];
     float sum = 0.0;
     for (int i = 0; i < k; i += BK){
-        sa[IDX2R(tx,ty,BM)] = A[IDX2C(tx,ty,m)];
-        sb[IDX2R(ty,tx,BK)] = B[IDX2C(tx,ty,k)]; // 一次读取一个方块
+        sa[IDX2R(tx,ty,BK)] = A[IDX2C(tx,ty,m)];
+        sb[IDX2R(ty,tx,BN)] = B[IDX2C(tx,ty,k)]; // 一次读取一个方块
         A += m<<5; // 一行 一次32行
         B += 32; //小方块一列32
         __syncthreads();
         for (int b_k = 0; b_k < BK; b_k++){
-            sum += sa[IDX2R(tx,b_k,BM)] * sb[IDX2R(ty,b_k,BK)];
+            sum += sa[IDX2R(tx,b_k,BK)] * sb[IDX2R(ty,b_k,BN)];
         }
         __syncthreads();
     }

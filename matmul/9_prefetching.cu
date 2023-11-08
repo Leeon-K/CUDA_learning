@@ -6,53 +6,24 @@
 #include <cuda.h>
 #include <iostream>
 
-#define A(i,j) A[(i) + (j)*lda]
-#define B(i,j) B[(i) + (j)*ldb]
-#define C(i,j) C[(i) + (j)*ldc]
-#define sa7(i,j) sa7[((j)<<6) + (i)]
-#define sb7(i,j) sb7[((j)<<6) + (i)]
-#define MS_7 64
-#define NS_7 64
-#define KS_7 16
-#define M 8192
-#define N 8192
-#define K 1024
+#define M 4096
+#define N 4096
+#define K 4096
 // 分块大小
-#define BM 64
-#define BN 64
-#define BK 16
+#define BM 128
+#define BN 128
+#define BK 8
 // #define A(i,j) A[(i) + (j)*lda]
 // #define B(i,j) B[(i) + (j)*ldb]
-// #define C(i,j) C[(i) + (j)*ldc]
-#define IDX2C(i, j, ld) ((j) * (ld) + (i)) // columb-major
-//v1 += v2 * s3, vector scaling
-#define vscal(v1, v2, s3)\
-    v1.x+=v2.x*s3;\
-    v1.y+=v2.y*s3;\
-    v1.z+=v2.z*s3;\
-    v1.w+=v2.w*s3;
-//v1 = alpha * v2 + beta * v3, simd fma
-#define simd_axpby(v1, alpha, v2, beta, v3)\
-    v1.x=alpha*v2.x+beta*v3.x;\
-    v1.y=alpha*v2.y+beta*v3.y;\
-    v1.z=alpha*v2.z+beta*v3.z;\
-    v1.w=alpha*v2.w+beta*v3.w;
-#define vload(v1,addr)\
-    v1 = *((float4 *)(addr));
-#define vstore(addr,v1)\
-    *((float4 *)(addr)) = v1;
-#include<stdio.h>
-#include<stdlib.h>
-#define A(i,j) A[(i) + (j)*lda]
-#define B(i,j) B[(i) + (j)*ldb]
-#define ptr_A(i,j) ptr_A[(i) + (j)*lda]
-#define ptr_B(i,j) ptr_B[(i) + (j)*ldb]
 #define C(i,j) C[(i) + (j)*ldc]
-#define sa10(i,j) sa10[((j)<<7) + (i)]
-#define sb10(i,j) sb10[((j)<<7) + (i)]
-#define MS_10 128
-#define NS_10 128
-#define KS_10 8
+#define IDX2C(i, j, ld) ((j) * (ld) + (i)) // columb-major
+#define IDX2R(i, j, lr) ((i) * (lr) + (j)) // row-major
+// #define vload(v1,addr) v1 = *((float4 *)(addr));
+// #define vstore(addr,v1) *((float4 *)(addr)) = v1;
+#define vload(v1,addr)\
+    v1 = *((float4 *)(addr));
+#define vstore(addr,v1)\
+    *((float4 *)(addr)) = v1;
 //v1 += v2 * s3, vector scaling
 #define vscal(v1, v2, s3)\
     v1.x+=v2.x*s3;\
@@ -65,14 +36,19 @@
     v1.y=alpha*v2.y+beta*v3.y;\
     v1.z=alpha*v2.z+beta*v3.z;\
     v1.w=alpha*v2.w+beta*v3.w;
-#define vload(v1,addr)\
-    v1 = *((float4 *)(addr));
-#define vstore(addr,v1)\
-    *((float4 *)(addr)) = v1;
-// cache blocking version, without register-level data re-use
-// with memory coelascing on shared memory
-// more workloads per thread. 8x8 micro kernel.
-// adopt vetorized load/store
+
+void cpuSgemm(const int m,const int n,const int k,const float* alpha, const float *A, const float *B,
+    const float *beta, float* C){
+    for (int idx_m = 0; idx_m < m; idx_m++){
+        for (int idx_n = 0;idx_n < n; idx_n++){
+            float sum = 0.0;
+            for (int idx_k = 0; idx_k < k; idx_k++){
+                sum += A[IDX2C(idx_m, idx_k, m)] * B[IDX2C(idx_k,idx_n,k)];
+            }
+            C[IDX2C(idx_m,idx_n,m)] = sum* *(alpha) + *(beta) *C[IDX2C(idx_m,idx_n,m)];
+        }
+    }
+}
 __global__ void naive_matmul(const int m,const int n,const int k,const float alpha, const float *A, const float *B, const float beta, float* C)
 {
     int tx = threadIdx.x, ty = threadIdx.y;
@@ -86,114 +62,60 @@ __global__ void naive_matmul(const int m,const int n,const int k,const float alp
     }
     C[IDX2C(tx,ty,m)] = alpha * sum + beta * C[IDX2C(tx,ty,m)];
 }
-// cache blocking version, without register-level data re-use
-// with memory coelascing on shared memory
-// more workloads per thread. 4x4 micro kernel.
-// adopt vetorized load/store
-// __global__  __launch_bounds__(256)
-__global__ void mysgemm_v7(int m, int n, int k, float alpha, float* A, float* B, float beta, float* C)
+
+__global__ void gemm_submat_prefetch(const int m,const int n,const int k,const float alpha, float *A, float *B, const float beta, float* C)
 {
-    int lda = M, ldb = K, ldc = M;
-    int tx = threadIdx.x;
+    // 分配共享内存  
+    __shared__ float sa[1024];
+    __shared__ float sb[1024];
+    int ldc = m;
+    int tx = threadIdx.x; // 一个block有256个线程
     int bx = blockIdx.x, by = blockIdx.y;
-    int row_a = (tx&15)<<2, col_a = tx>>4;
-    int row_b = (tx&3)<<2, col_b = tx>>2;
-    int col_c = col_a<<2;
-    int lda16 = lda<<4;
-    A = &A((bx<<6),0); // 一个block256线程 解决64*64个元素
-    B = &B(0,(by<<6));
-    C = &C((bx<<6),(by<<6));//the TB size is 64.
-    __shared__ float sa7[1024];
-    __shared__ float sb7[1024];
-    float4 Av, Bv, Cv[4], Cres[4];
-    memset(Cres, 0, sizeof(Cres)); //
-    for (int k_count = 0; k_count<K; k_count+=KS_7){
-        vload(Av, &A[IDX2C(row_a, col_a, lda)])
-        vload(Bv, &B(row_b, col_b))
-        ((float4 *)sa7)[tx] = Av;
-        sb7(col_b,row_b)=Bv.x;
-        sb7(col_b,row_b+1)=Bv.y;
-        sb7(col_b,row_b+2)=Bv.z;
-        sb7(col_b,row_b+3)=Bv.w;
-        A+=lda16;B+=16;
-        __syncthreads();
-        #pragma unroll
-        for (int inner_k_count=0;inner_k_count<KS_7;inner_k_count++){
-            vload(Av, &sa7[IDX2C(row_a, inner_k_count, BM)])
-            vload(Bv, &sb7[IDX2C(col_c, inner_k_count, BM)])
-            // vload(Av, &sa7(row_a,inner_k_count))
-            // vload(Bv, &sb7(col_c,inner_k_count))
-            vscal(Cres[0], Av, Bv.x)
-            vscal(Cres[1], Av, Bv.y)
-            vscal(Cres[2], Av, Bv.z)
-            vscal(Cres[3], Av, Bv.w)
-        }
-        __syncthreads();
-    }
-    vload(Cv[0], &C[IDX2C(row_a,col_c,m)])
-    vload(Cv[1], &C[IDX2C(row_a,col_c+1,m)])
-    vload(Cv[2], &C[IDX2C(row_a,col_c+2,m)])
-    vload(Cv[3], &C[IDX2C(row_a,col_c+3,m)]) // 向量化读
-    simd_axpby(Cres[0],alpha,Cres[0],beta,Cv[0])
-    simd_axpby(Cres[1],alpha,Cres[1],beta,Cv[1])
-    simd_axpby(Cres[2],alpha,Cres[2],beta,Cv[2])
-    simd_axpby(Cres[3],alpha,Cres[3],beta,Cv[3])
-
-    vstore(&C[IDX2C(row_a,col_c, m)], Cres[0])
-    vstore(&C[IDX2C(row_a,col_c + 1, m)], Cres[1])
-    vstore(&C[IDX2C(row_a,col_c + 2, m)], Cres[2])
-    vstore(&C[IDX2C(row_a,col_c + 3, m)], Cres[3])  // 向量化写
-}
-
-// __global__  __launch_bounds__(256)
-__global__ void mysgemm_v10(int m, int n, int k, float alpha, float* A, float* B, float beta, float* C){
-    int lda = M, ldb = K, ldc = M;
-    int tx = threadIdx.x;
-    int bx = blockIdx.x, by = blockIdx.y;
-    int warp_id = tx>>5;
+    int warp_id = tx>>5; // 256 分为 8个warp
     int lane_id = tx&31;
-    int warp_row = warp_id & 3, warp_col = warp_id >> 2;
+    int warp_row = warp_id & 3, warp_col = warp_id >> 2; // warp级别的并行
     int row_w = lane_id&3, col_w = lane_id>>2;
-    int row_b = (tx&1)<<2, col_b = tx>>1;
-    int lda8 = lda<<3;
+    
     int row_c = (warp_row<<5) + (row_w<<3), col_c = (warp_col<<6) + (col_w<<3);
     int row_a = (tx&31)<<2, col_a = tx>>5;
-    int K_upper = K>>3;
-    A = &A((bx<<7),0);
-    B = &B(0,(by<<7));
-    C = &C((bx<<7),(by<<7));//the TB size is 128.
-    __shared__ float sa10[1024];
-    __shared__ float sb10[1024];
-    float4 Av1[2], Av2[2], Bv1[2], Bv2[2], Cv[16], Cres[16];
+    int row_b = (tx&1)<<2, col_b = tx>>1;
+    
+    A = &A[IDX2C(bx<<7,0,m)]; //分为 64 64 的小块
+    B = &B[IDX2C(0,by<<7,k)];
+    C = &C[IDX2C(bx<<7,by<<7,m)];
+    // float4 Av1, Av2, Bv1, Bv2,  Cv[16], Cres[16];
+    float4 Av1[2], Av2[2], Bv1[2], Bv2[2],  Cv[16], Cres[16];
     float4 pref_Av, pref_Bv;
     float* ptr_A, *ptr_B;
-    memset(Cres, 0, sizeof(Cres));//clear registers
-    vload(pref_Av, &A(row_a,col_a))
-    vload(pref_Bv, &B(row_b,col_b))
-    ((float4 *)sa10)[tx] = pref_Av;
-    sb10(col_b,row_b)=pref_Bv.x;
-    sb10(col_b,row_b+1)=pref_Bv.y;
-    sb10(col_b,row_b+2)=pref_Bv.z;
-    sb10(col_b,row_b+3)=pref_Bv.w;
-    __syncthreads();
-    vload(Av1[0], &sa10(row_c,0))
-    vload(Av2[0], &sa10(row_c+4,0))
-    vload(Bv1[0], &sb10(col_c,0))
-    vload(Bv2[0], &sb10(col_c+4,0))
-    for (int k_count = 0; k_count<K_upper; k_count++){
+    vload(pref_Av, &A[IDX2C(row_a, col_a, m)]);
+    vload(pref_Bv, &B[IDX2C(row_b, col_b, k)]);
+    ((float4 *)sa)[tx] = pref_Av;
+    sb[IDX2C(col_b,row_b,BN)] = pref_Bv.x; // 一次读取四个
+    sb[IDX2C(col_b,row_b+1,BN)] = pref_Bv.y; 
+    sb[IDX2C(col_b,row_b+2,BN)] = pref_Bv.z; 
+    sb[IDX2C(col_b,row_b+3,BN)] = pref_Bv.w; 
+
+    __syncthreads(); // 同步
+    vload(Av1[0], &sa[IDX2C(row_c, 0, BM)]) // 行分块
+    vload(Av2[0], &sa[IDX2C(row_c+4, 0, BM)]) // 列分块
+    vload(Bv1[0], &sb[IDX2C(col_c, 0, BN)]) // 行分块
+    vload(Bv2[0], &sb[IDX2C(col_c+4, 0, BN)]) // 列分块
+    
+    memset(Cres, 0, sizeof(Cres));
+    for (int b_k = 0; b_k < (k >> 3); b_k++){
         /*packing A and B into shared memory*/
-        int inc = (k_count+1)%K_upper;
-        ptr_A = A + inc * lda8;
+        int inc = (b_k+1)%(k >> 3); 
+        ptr_A = A + inc * m * 8;
         ptr_B = B + inc * 8;
-        vload(pref_Av, &ptr_A(row_a,col_a))
-        vload(pref_Bv, &ptr_B(row_b,col_b))
+        vload(pref_Av, &ptr_A[IDX2C(row_a,col_a,m)])
+        vload(pref_Bv, &ptr_B[IDX2C(row_b,col_b,k)])
         #pragma unroll
-        for (int inner_k_count=0;inner_k_count<KS_10;inner_k_count++){
-            int next_inner_k_count = (inner_k_count+1)&7;
-            vload(Av1[(inner_k_count+1)&1], &sa10(row_c,next_inner_k_count))
-            vload(Av2[(inner_k_count+1)&1], &sa10(row_c+4,next_inner_k_count))
-            vload(Bv1[(inner_k_count+1)&1], &sb10(col_c,next_inner_k_count))
-            vload(Bv2[(inner_k_count+1)&1], &sb10(col_c+4,next_inner_k_count))
+        for (int inner_k_count=0;inner_k_count<BK;inner_k_count++){
+            int next_inner_k_count = (inner_k_count + 1) & 7;
+            vload(Av1[(inner_k_count+1)&1], &sa[IDX2C(row_c,next_inner_k_count,BM)])
+            vload(Av2[(inner_k_count+1)&1], &sa[IDX2C(row_c+4,next_inner_k_count,BM)])
+            vload(Bv1[(inner_k_count+1)&1], &sb[IDX2C(col_c,next_inner_k_count,BN)])
+            vload(Bv2[(inner_k_count+1)&1], &sb[IDX2C(col_c+4,next_inner_k_count,BN)])
             vscal(Cres[0], Av1[(inner_k_count)&1], Bv1[(inner_k_count)&1].x)
             vscal(Cres[1], Av2[(inner_k_count)&1], Bv1[(inner_k_count)&1].x)
             vscal(Cres[2], Av1[(inner_k_count)&1], Bv1[(inner_k_count)&1].y)
@@ -212,53 +134,38 @@ __global__ void mysgemm_v10(int m, int n, int k, float alpha, float* A, float* B
             vscal(Cres[15], Av2[(inner_k_count)&1], Bv2[(inner_k_count)&1].w)
         }
         __syncthreads();
-        ((float4 *)sa10)[tx] = pref_Av;
-        sb10(col_b,row_b)=pref_Bv.x;
-        sb10(col_b,row_b+1)=pref_Bv.y;
-        sb10(col_b,row_b+2)=pref_Bv.z;
-        sb10(col_b,row_b+3)=pref_Bv.w;
+        ((float4 *)sa)[tx] = pref_Av;
+        sb[IDX2C(col_b,row_b,BN)]=pref_Bv.x;
+        sb[IDX2C(col_b,row_b+1,BN)]=pref_Bv.y;
+        sb[IDX2C(col_b,row_b+2,BN)]=pref_Bv.z;
+        sb[IDX2C(col_b,row_b+3,BN)]=pref_Bv.w;
         __syncthreads();
-        vload(Av1[0], &sa10(row_c,0))
-        vload(Av2[0], &sa10(row_c+4,0))
-        vload(Bv1[0], &sb10(col_c,0))
-        vload(Bv2[0], &sb10(col_c+4,0))
+        vload(Av1[0], &sa[IDX2C(row_c,0,BM)])
+        vload(Av2[0], &sa[IDX2C(row_c+4,0,BM)])
+        vload(Bv1[0], &sb[IDX2C(col_c,0,BN)])
+        vload(Bv2[0], &sb[IDX2C(col_c+4,0,BN)])
     }
-    vload(Cv[0], &C(row_c,col_c))
-    vload(Cv[1], &C(row_c+4,col_c))
-    vload(Cv[2], &C(row_c,col_c+1))
-    vload(Cv[3], &C(row_c+4,col_c+1))
-    vload(Cv[4], &C(row_c,col_c+2))
-    vload(Cv[5], &C(row_c+4,col_c+2))
-    vload(Cv[6], &C(row_c,col_c+3))
-    vload(Cv[7], &C(row_c+4,col_c+3))
-    vload(Cv[8], &C(row_c,col_c+4))
-    vload(Cv[9], &C(row_c+4,col_c+4))
-    vload(Cv[10], &C(row_c,col_c+5))
-    vload(Cv[11], &C(row_c+4,col_c+5))
-    vload(Cv[12], &C(row_c,col_c+6))
-    vload(Cv[13], &C(row_c+4,col_c+6))
-    vload(Cv[14], &C(row_c,col_c+7))
-    vload(Cv[15], &C(row_c+4,col_c+7))
     
-    simd_axpby(Cres[0],alpha,Cres[0],beta,Cv[0])
-    simd_axpby(Cres[1],alpha,Cres[1],beta,Cv[1])
-    simd_axpby(Cres[2],alpha,Cres[2],beta,Cv[2])
-    simd_axpby(Cres[3],alpha,Cres[3],beta,Cv[3])
-
-    simd_axpby(Cres[4],alpha,Cres[4],beta,Cv[4])
-    simd_axpby(Cres[5],alpha,Cres[5],beta,Cv[5])
-    simd_axpby(Cres[6],alpha,Cres[6],beta,Cv[6])
-    simd_axpby(Cres[7],alpha,Cres[7],beta,Cv[7])
-
-    simd_axpby(Cres[8],alpha,Cres[8],beta,Cv[8])
-    simd_axpby(Cres[9],alpha,Cres[9],beta,Cv[9])
-    simd_axpby(Cres[10],alpha,Cres[10],beta,Cv[10])
-    simd_axpby(Cres[11],alpha,Cres[11],beta,Cv[11])
-
-    simd_axpby(Cres[12],alpha,Cres[12],beta,Cv[12])
-    simd_axpby(Cres[13],alpha,Cres[13],beta,Cv[13])
-    simd_axpby(Cres[14],alpha,Cres[14],beta,Cv[14])
-    simd_axpby(Cres[15],alpha,Cres[15],beta,Cv[15])
+    vload(Cv[0], &C[IDX2C(row_c,col_c,m)])
+    vload(Cv[1], &C[IDX2C(row_c+4,col_c,m)])
+    vload(Cv[2], &C[IDX2C(row_c,col_c+1,m)])
+    vload(Cv[3], &C[IDX2C(row_c+4,col_c+1,m)]) // 向量化读
+    vload(Cv[4], &C[IDX2C(row_c,col_c+2,m)])
+    vload(Cv[5], &C[IDX2C(row_c+4,col_c+2,m)])
+    vload(Cv[6], &C[IDX2C(row_c,col_c+3,m)])
+    vload(Cv[7], &C[IDX2C(row_c+4,col_c+3,m)]) // 向量化读
+    vload(Cv[8], &C[IDX2C(row_c,col_c+4,m)])
+    vload(Cv[9], &C[IDX2C(row_c+4,col_c+4,m)]) 
+    vload(Cv[10], &C[IDX2C(row_c,col_c+5,m)])
+    vload(Cv[11], &C[IDX2C(row_c+4,col_c+5,m)])
+    vload(Cv[12], &C[IDX2C(row_c,col_c+6,m)])
+    vload(Cv[13], &C[IDX2C(row_c+4,col_c+6,m)])
+    vload(Cv[14], &C[IDX2C(row_c,col_c+7,m)])
+    vload(Cv[15], &C[IDX2C(row_c+4,col_c+7,m)])
+    
+    for (int i = 0; i < 16; i++){
+        simd_axpby(Cres[i],alpha,Cres[i],beta,Cv[i])
+    }
 
     vstore(&C(row_c,col_c), Cres[0])
     vstore(&C(row_c+4,col_c), Cres[1])
@@ -277,13 +184,14 @@ __global__ void mysgemm_v10(int m, int n, int k, float alpha, float* A, float* B
     vstore(&C(row_c,col_c+7), Cres[14])
     vstore(&C(row_c+4,col_c+7), Cres[15])
 }
+
 void gpuSgemm(int m, int n, int k, const float *alpha, 
     const float *A, const float *B, const float *beta, float *C) {
         int blocksize = 256;
         // int GridSize = ceil(sqrt((N+bs-1.) / bs));
         // int GridSize = ceil((M*N+blocksize-1.) / blocksize);
-        int gridx = floor(M/BM);
-        int gridy = floor(N/BN);
+        int gridx = floor(m/BM);
+        int gridy = floor(n/BN);
         dim3 Grid(gridx, gridy); //
         dim3 Block(256); // 32 * 32 = 1024  
         //malloc on device
@@ -300,7 +208,7 @@ void gpuSgemm(int m, int n, int k, const float *alpha,
         cudaEventCreate(&stop);
         cudaEventRecord(start);
 // ------------------------------------------------------------------------------------
-        mysgemm_v10<<<Grid,Block>>>(m,n,k,*alpha,devPtrA,devPtrB,*beta,devPtrC);
+        gemm_submat_prefetch<<<Grid,Block>>>(m,n,k,*alpha,devPtrA,devPtrB,*beta,devPtrC);
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
     
@@ -310,12 +218,12 @@ void gpuSgemm(int m, int n, int k, const float *alpha,
         float* matrix_out_cpu=(float*)malloc(sizeof(float) * M * N);
         float* matrix_out_gpu=(float*)malloc(sizeof(float) * M * N);
         cudaMemcpy(matrix_out_cpu, devPtrC, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-        dim3 Grid_n(M/32, N/32); //
+        dim3 Grid_n(m/32, n/32); //
         dim3 Block_n(32,32); // 32 * 32 = 1024  
         naive_matmul<<<Grid_n,Block_n>>>(m,n,k,*alpha,devPtrA,devPtrB,*beta,devPtrD);
         cudaMemcpy(matrix_out_gpu, devPtrD, m * n * sizeof(float), cudaMemcpyDeviceToHost);
 
-        float EPSILON = 0.01;
+        float EPSILON = 0.1;
         // check result                                             
         printf("check\n");
         for (int i = 0; i < M * N; ++i) {

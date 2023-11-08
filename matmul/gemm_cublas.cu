@@ -10,7 +10,7 @@
 // check  M*K  K*N
 #define M 4096 
 #define N 4096 
-#define K 1024
+#define K 4096
 // #define M 32
 // #define N 8
 // #define K 16
@@ -106,7 +106,7 @@ int main() {
     gpuBlasSgemm(M, N, K, &a, matrix_in1, matrix_in2, &b, matrix_out_gpu_blas);
     stop=clock();
     duration=(double)(stop-start)/CLOCKS_PER_SEC;
-    printf("gpu with blas time:%f\n",duration);
+    // printf("gpu with blas time:%f\n",duration); ?????
 
     // check result                                             
     // printf("check\n");
