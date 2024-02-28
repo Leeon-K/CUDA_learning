@@ -1,3 +1,5 @@
+记录了初学cuda的一些学习代码
+
 ## Reduce优化
 #### baseline
 ```
