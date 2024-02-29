@@ -63,30 +63,6 @@ __device__ __forceinline__ T blockReduce(T val){
 }
 
 
-// // {vec 1*N  mat N*M} = res 1*M ,VECS_PER_THREAD =  (N / THREAD_NUMS) / VEC_SIZE , num_cols=N
-// template<int VECS_PER_THREAD, int VEC_SIZE, int THREAD_NUMS>
-// __global__ void gemv(T* d_mat, T* d_vec, T* d_dst, int num_cols){
-//     // v0 基础版本
-//     // 一个grid负责一行，N列 每个block计算得出256个元素相乘的结果
-//     // 每个元素直接从global memory中读取
-//     int tid = threadIdx.x; // 第几个元素
-//     int bid = blockIdx.x;  // 行
-//     float sum = 0 = 0.0f;
-//     for (int i=0; i<VECS_PER_THREAD; i++){
-//         float vec = d_vec[tid * VEC_SIZE]; // vec_offset = tid * VECS_PER_THREAD + i
-//         float mat = d_mat[bid*num_cols + tid * VEC_SIZE]; // 
-//         sum += vec[i] * mat[i];
-//     }
-
-//     float reduce_res = blockReduce<SumOp,float>(sum);
-
-//     if (tid == 0){ //计算完成 每个block的第一个线程负责写入
-//         d_dst[bid] = reduce_res;
-//     }
-//     __syncthreads();
-// }
-
-
 // 一个blk计算一个元素
 // mat * vec = {M, N} * {N, 1}/{1, N}   num_cols = N
 template<int VECS_PER_THREAD, int VEC_SIZE>
@@ -266,6 +242,8 @@ namespace gemv2 {
 } // namespace gemv2
 
 // fp4 向量化读写
+// 行主序 mat (row major) {N*M} 
+// vec {1*N}  mat {N*M}  res {1*M}
 // 1个block处理一个[1, M], 循环处理完[N, M]
 // for fp32: <64, M * sizeof(T) / 16 = M / 4, 4>
 template<int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
