@@ -1,15 +1,19 @@
 #include "gemv.cuh"
 
-// 列主序 mat (col major) {N*M} 
+// 行主序 mat (row major) {N*M} 
 // vec {1*N}  mat {N*M}  res {1*M}
 template <typename T>
 void gemvCPU(T* mat, T* vec, T* res, int M, int N) {
   for (int i = 0; i < M; i++) {
     T sum = 0;
     for (int j = 0; j < N; j++) {
-      sum += mat[i * N + j] * vec[j]; 
+      sum += mat[i + j * M] * vec[j]; 
     }
     res[i] = sum;
+    if (i < 5)
+        {
+            printf("cpu res = %f\n", res[i]);
+        }
   }
 }
 
@@ -36,7 +40,7 @@ void gemv_kernel(T* vec,
                  T* d_dst
                  ) {
     constexpr int N = 2048;//256 * 8
-    constexpr int M = 512;
+    constexpr int M = 256;
 
 //  initialize<T>(vec, d_vec, mat, d_mat, dst, d_dst, M, N);
     vec = (T *)malloc(N * sizeof(T));
@@ -66,9 +70,9 @@ void gemv_kernel(T* vec,
     constexpr int THREADS_PER_BLOCK = 256; // 每个block 256个线程（max=1024）
     // constexpr int VEC_SIZE = 1; // fp32向量长度 vec_size = 4 -->fp4 ;= 1
     constexpr int VEC_SIZE = 4;
-    constexpr int VECS_PER_THREAD = (N / THREADS_PER_BLOCK) / VEC_SIZE; // N / 256 / VEC_SIZE = 2  16不行
+    constexpr int THREADS_PER_VALUE = M * sizeof(T) / 16; // ?
     // dispatch kernel 
-    DispatchLauncher<VECS_PER_THREAD, VEC_SIZE, THREADS_PER_BLOCK>::template launcher<T>(d_mat, d_vec, d_dst, M, N);
+    DispatchLauncher2<THREADS_PER_BLOCK,THREADS_PER_VALUE, VEC_SIZE>::template launcher<T>(d_mat, d_vec, d_dst, M, N);
     
     CHECK(cudaMemcpy(dst, d_dst, M * sizeof(T), cudaMemcpyDeviceToHost));
     // cudaMemcpy(dst, d_dst, M * sizeof(T), cudaMemcpyDeviceToHost);

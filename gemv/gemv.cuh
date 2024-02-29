@@ -62,26 +62,6 @@ __device__ __forceinline__ T blockReduce(T val){
     return warpReduce<ReductionOp, T>(warp_val);
 }
 
-// // 把block reduce拆分为多个warp reduce来计算
-// template<template<typename> class ReductionOp, typename T>
-// __device__ __forceinline__ T blockReduce(T val){
-//     int tid = threadIdx.x;
-//     int warp_id = tid / 32;
-//     int lane_id = tid % 32;
-//     // 向上进1，以防分配的线程数量小于32导致warp nums为0
-//     int warp_nums = (blockDim.x + 31) / 32;
-//     static __shared__ float warpres[64];
-//     // block内每个warp reduce的结果，该结果保存在每个warp内的0号线程，所以L65用0号线程写入warp res
-//     val = warpReduce<ReductionOp, T>(val);
-//     if (lane_id == 0){
-//         warpres[warp_id] = val;
-//     }
-//     __syncthreads();
-//     // 最后把每个warp的结果再作一个reduce得到最终一个block的结果
-//     float warp_val = tid < warp_nums ? warpres[tid] : 0;
-//     return warpReduce<ReductionOp, T>(warp_val);
-// }
-
 
 // // {vec 1*N  mat N*M} = res 1*M ,VECS_PER_THREAD =  (N / THREAD_NUMS) / VEC_SIZE , num_cols=N
 // template<int VECS_PER_THREAD, int VEC_SIZE, int THREAD_NUMS>
@@ -108,16 +88,38 @@ __device__ __forceinline__ T blockReduce(T val){
 
 
 // 一个blk计算一个元素
-// mat * vec = {M, N} * {N, 1}/{1, N}
+// mat * vec = {M, N} * {N, 1}/{1, N}   num_cols = N
 template<int VECS_PER_THREAD, int VEC_SIZE>
 __global__ void gemv(float* d_mat, float* d_vec, float* res, int num_cols) {
     int tid = threadIdx.x; // 第几个元素
-    int bid = blockIdx.x;  // 行
+    int bid = blockIdx.x;  // 列 列主序
     float thread_local_sum = 0.0f;
+    // VECS_PER_THREAD = N / THREAD_NUMS / VEC_SIZE = 8
     for (int i=0; i<VECS_PER_THREAD; i++){
-        float* vec = &d_vec[tid * VEC_SIZE]; // vec_offset = tid * VECS_PER_THREAD + i
-        float* mat = &d_mat[bid*num_cols + tid * VEC_SIZE]; // 
-        thread_local_sum += vec[i] * mat[i];
+        thread_local_sum += d_vec[tid * VEC_SIZE + i * blockDim.x] * d_mat[bid * num_cols + tid * VEC_SIZE + i * blockDim.x];
+    }
+    //reduce to get the final val
+    float reduce_res = blockReduce<SumOp, float>(thread_local_sum);
+    //store to gmem
+    if(tid == 0) {
+        res[blockIdx.x] = reduce_res;
+    }
+    __syncthreads();
+}
+
+
+// fp4 向量化读写
+template<int VECS_PER_THREAD, int VEC_SIZE>
+__global__ void gemv_fp4(float* d_mat, float* d_vec, float* res, int num_cols) {
+    int tid = threadIdx.x; // 第几个元素
+    int bid = blockIdx.x;  // 列 列主序
+    float thread_local_sum = 0.0f;
+    // VECS_PER_THREAD = N / THREAD_NUMS / VEC_SIZE = 8
+    for (int i=0; i<VECS_PER_THREAD; i++){
+        float4* vec4 = reinterpret_cast<float4*>(&d_vec[tid*VEC_SIZE]);
+        float4* mat4 = reinterpret_cast<float4*>(&d_mat[bid*num_cols + tid*VEC_SIZE]);
+        int idx = i*blockDim.x;
+        thread_local_sum += vec4[idx].x * mat4[idx].x + vec4[idx].y * mat4[idx].y + vec4[idx].z * mat4[idx].z + vec4[idx].w * mat4[idx].w;
     }
     //reduce to get the final val
     float reduce_res = blockReduce<SumOp, float>(thread_local_sum);
@@ -141,7 +143,8 @@ struct DispatchLauncher{
         cudaEventCreate(&stop);
         cudaEventRecord(start);
         printf("calling\n");
-        gemv<VECS_PER_THREAD, VEC_SIZE><<<Grid, Block>>>(d_mat, d_vec, d_dst, N);
+        // gemv<VECS_PER_THREAD, VEC_SIZE><<<Grid, Block>>>(d_mat, d_vec, d_dst, N);
+        gemv_fp4<VECS_PER_THREAD, VEC_SIZE><<<Grid, Block>>>(d_mat, d_vec, d_dst, N);
         cudaError_t result = cudaGetLastError();
         if (result) {
             throw std::runtime_error(std::string("[ERROR] CUDA runtime error: ") +  (_cudaGetErrorEnum(result)) + " " + __FILE__ + ":" + std::to_string(__LINE__) + " \n");
@@ -153,3 +156,181 @@ struct DispatchLauncher{
         printf("gemv latency = %f ms\n", milliseconds);
     }
 }; // 数据类型
+
+
+
+
+// vec * mat, mat is row major
+// [1, N] * [N, M]
+// logits * v
+// 有关fp32/fp16 fma和add的各种重载操作
+namespace gemv2 {
+    struct half8 {
+        half2 h1;
+        half2 h2;
+        half2 h3;
+        half2 h4;
+
+        __device__ half8& operator = (half8 h8) {
+            h1 = h8.h1;
+            h2 = h8.h2;
+            h3 = h8.h3;
+            h4 = h8.h4;
+            return *this;
+        }
+    };
+
+    template<int M, typename T>
+    struct get_threads_per_mat_row {
+        static const int value = M * sizeof(T) / 16;
+    };
+
+    inline __device__ float add(float a, float b)
+    {
+        return a + b;
+    }
+
+    inline __device__ float4 add(float4 a, float4 b)
+    {
+        float4 c;
+        c.x = gemv2::add(a.x, b.x);
+        c.y = gemv2::add(a.y, b.y);
+        c.z = gemv2::add(a.z, b.z);
+        c.w = gemv2::add(a.w, b.w);
+        return c;
+    }
+    inline __device__ half add(half a, half b)
+    {
+        //return __hadd(a, b);
+        //if use L216, half+half is not really adding, its so weird, which  cause our result is 32, not 256
+        return (half)((float)a+(float)b);
+    }
+
+    inline __device__ half2 add(half2 a, half2 b)
+    {
+        half2 res;
+        res.x = gemv2::add(a.x, b.x);
+        res.y = gemv2::add(a.y, b.y);
+        return res;
+    }
+
+    inline __device__ half8 add(half8 a, half8 b)
+    {
+        half8 c;
+        c.h1 = gemv2::add(a.h1, b.h1);
+        c.h2 = gemv2::add(a.h2, b.h2);
+        c.h3 = gemv2::add(a.h3, b.h3);
+        c.h4 = gemv2::add(a.h4, b.h4);
+        return c;
+    }
+
+    inline __device__ half fma(half a, half b, half c)
+    {
+        // 有时候编译器会不认识__hmul或者__hadd，所以粗暴转成fp32计算再转回fp16
+        return __float2half((float)a * (float)b + (float)c);
+    }
+
+
+    inline __device__ half2 fma(half a, half2 b, half2 c)
+    {
+        half2 res;
+        res.x = gemv2::fma(a, b.x, c.x);
+        res.y = gemv2::fma(a, b.y, c.y);
+        return res;
+    }
+
+    inline __device__ half8 fma(half a, half8 b, half8 c)
+    {
+        half8 d;
+        d.h1 = gemv2::fma(a, b.h1, c.h1);
+        d.h2 = gemv2::fma(a, b.h2, c.h2);
+        d.h3 = gemv2::fma(a, b.h3, c.h3);
+        d.h4 = gemv2::fma(a, b.h4, c.h4);
+        return d;
+    }
+
+    inline __device__ float fma(float a, float b, float c)
+    {
+        return a * b + c;
+    }
+
+    inline __device__ float4 fma(float a, float4 b, float4 c)
+    {
+        float4 d;
+        d.x = gemv2::fma(a, b.x, c.x);
+        d.y = gemv2::fma(a, b.y, c.y);
+        d.z = gemv2::fma(a, b.z, c.z);
+        d.w = gemv2::fma(a, b.w, c.w);
+        return d;
+    }
+} // namespace gemv2
+
+// fp4 向量化读写
+// 1个block处理一个[1, M], 循环处理完[N, M]
+// for fp32: <64, M * sizeof(T) / 16 = M / 4, 4>
+template<int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
+__global__ void gemv_fp4_v2(float* matrix, float* vector, float* res, int N, int M) {
+    int tid = threadIdx.x; // 第几个元素
+    int mat_o = tid / THREADS_PER_VALUE; // mat offset
+    int mat_i = tid % THREADS_PER_VALUE * VEC_SIZE; // mat offset
+    int bid = blockIdx.x;  // (行主序)
+    // 一个block处理的行数
+    constexpr int ROW_PER_ITER = THREADS_PER_BLOCK / THREADS_PER_VALUE;
+    __shared__ float out_smem[512];
+    float4 out;
+    // 点乘或fma，inter-block循环累加
+    for (int ti = mat_o; ti < N; ti += ROW_PER_ITER) {
+        float4 mat = *reinterpret_cast<float4*>(&matrix[ti * M + mat_i]);
+        float logits = vector[ti];
+        // fused mul and add: d = a * b + c
+        out = gemv2::fma(logits, mat, out);
+    }
+    // intra-block二分法相加得最终结果
+    for (int ROWS_PER_BLOCK = ROW_PER_ITER; ROWS_PER_BLOCK >= 2; ROWS_PER_BLOCK /= 2) {
+        int midpoint = ROWS_PER_BLOCK / 2;
+        if (mat_o >= midpoint && mat_o < ROWS_PER_BLOCK) {
+            *reinterpret_cast<float4*>(&out_smem[(mat_o - midpoint) * M + mat_i]) = out;
+        }
+        __syncthreads();
+        if (mat_o < midpoint) {
+            // ROW_PER_ITER中上半部分out和下半部分out相加
+            out = gemv2::add(*reinterpret_cast<float4*>(&out_smem[mat_o * M + mat_i]), out);
+        }
+        __syncthreads();
+    }
+    // 二分法最终结果存在首行，写回显存
+    if (mat_o == 0) {
+        *reinterpret_cast<float4*>(&res[mat_i]) = out;
+    }
+    __syncthreads();
+}
+
+// 模板可以根据不同size的数据 设置不同的kernel
+
+template<int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
+struct DispatchLauncher2
+{
+    template<typename T>
+    static void launcher(T* d_mat, T* d_vec, T* d_dst, int M, int N){
+        dim3 Grid(1);
+        dim3 Block(THREADS_PER_BLOCK);
+        float milliseconds = 0;
+        // 使用cudaevent计时，开销最小
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start);
+        printf("calling\n");
+        // 启动cuda kernel
+        gemv_fp4_v2<THREADS_PER_BLOCK, THREADS_PER_VALUE, VEC_SIZE><<<Grid, Block>>>(d_mat, d_vec, d_dst, N, M);
+        cudaError_t result = cudaGetLastError();
+        if (result) {
+            throw std::runtime_error(std::string("[ERROR] CUDA runtime error: ") +  (_cudaGetErrorEnum(result)) + " " + __FILE__ + ":" + std::to_string(__LINE__) + " \n");
+        }
+        printf("called\n");
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        printf("gemv latency = %f ms\n", milliseconds);
+    }
+};
